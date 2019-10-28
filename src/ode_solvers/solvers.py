@@ -1,13 +1,14 @@
 import tensorflow as tf
+import tensorflow.keras as k
 
 """
 dopri magic numbers
 """
-def converter(obj):
+def converter(obj, dtype=tf.float64):
     tmp = []
     for o in obj:
         tmp.append(
-            tf.convert_to_tensor(o, dtype=tf.float64),
+            tf.convert_to_tensor(o, dtype=dtype),
             )
     return tmp
 
@@ -27,96 +28,103 @@ B = [
     [5179 / 57600, 0, 7571 / 16695, 393 / 640, -92097 / 339200, 187 / 2100, 1 / 40],
 ]
 
-C = converter(C)
-B = converter(B)
-A = converter(A)
 
 
-class OdeSolver:
-    def __init__(self, f, y0, t, h=1e-3, dense=False, max_N=100, dtype=tf.float64, adaptive=False):
-        self.f = f
-        self.y0 = y0
-        self.y = y0
-        self.t0 = t[0]
-        self.tf = t[1]
-        self.t = self.t0
+class OdeSolver(k.layers.Layer):
+    def __init__(self,  h=1e-3, dense=False, max_N=100, adaptive=False, **kwargs):
         self.h = h
         self.tau = 0
         self.max_N = max_N
         self.n = 0
 
-        self.dtype = dtype
+        #self.dtype = dtype
         self.dense = dense
         self.adaptive = adaptive
-        if self.dense:
-            self.record = []
-            self.record.append(tf.concat([self.y, tf.expand_dims(self.t, -1)], axis=-1))
+        super(OdeSolver, self).__init__(**kwargs)
 
-    def step(self,):
-        y_prop = self.integrate()
+    def step(self, f, y, t):
+        y_prop = self.integrate(f, y, t)
         if self.adaptive:
-            self.y = y_prop
+            y = y_prop
         else:
-            self.y = y_prop
-        self.t = self.t + self.h
+            y = y_prop
         self.n += 1
-        if self.dense:
-            self.record.append(tf.concat([self.y, tf.expand_dims(self.t, -1)], axis=-1))
+        return y, t + self.h
 
-    def integrate(self,):
+    def integrate(self, f, y0, t):
         raise AttributeError("OdeSolver is not meant to be called directly")
         return 0
 
-    def solve(self,):
-        while self.n < self.max_N and self.t < self.tf:
-            self.step()
-        retval = self.output()
-        return retval
-
-    def output(self):
+    def __call__(self, f, y0, t):
         if self.dense:
-            retval = tf.stack(self.record)
+            #print(tf.shape(y0), tf.shape(t))
+            self.record = []
+            self.record.append([y0, t[0]])
+        ycur = y0
+        tcur = t[0]
+        while self.n < self.max_N and tcur < t[1]:
+            ycur, tcur = self.step(f, ycur, tcur)
+            if self.dense:
+                self.record.append([ycur, tcur])
+        if self.dense:
+            retval = self.record
         else:
-            retval = tf.convert_to_tensor((self.y, self.t))
+            retval = [ycur, tcur]
         return retval
 
 
 class euler(OdeSolver):
-    def __init__(self, f, y0, t, h=1e-3, dense=False, max_N=100, dtype=tf.float64):
-        super().__init__(f, y0, t, h=h, dense=dense, max_N=max_N, dtype=dtype)
+    def __init__(self, h=1e-3, dense=False, max_N=100, dtype=tf.float64):
+        super(euler, self).__init__(h=h, dense=dense, max_N=max_N, dtype=dtype)
 
-    def integrate(self):
-        return self.y + self.h * self.f(self.y, self.t)
+    def build(self, input_shape):
+        super(euler, self).build(input_shape)
+
+    def integrate(self, f, y, t):
+        return y + self.h * f(y, t)
 
 
 class dopri(OdeSolver):
-    def __init__(self, f, y0, t, h=1e-3, dense=False, max_N=100, dtype=tf.float64):
-        super().__init__(f, y0, t, h=h, dense=dense, max_N=max_N, dtype=dtype)
-        self.shape = tf.stack([tf.constant([7]), tf.shape(self.y)])
-        self.shape = tf.squeeze(self.shape)
+    def __init__(self, h=1e-3, dense=False, max_N=100, dtype=tf.float64):
+        super(dopri, self).__init__(h=h, dense=dense, max_N=max_N, dtype=dtype)
+
+    def build(self, input_shape):
+        self.C = converter(C, self.dtype)
+        self.B = converter(B, self.dtype)
+        self.A = converter(A, self.dtype)
+        self.shape = tf.concat([tf.constant([7]), input_shape], axis=-1)
+        #self.shape = tf.squeeze(self.shape)
         self.indices = []
         for i in range(7):
-            self.indices.append(tf.constant([[i]]))
+            self.indices.append(tf.constant([[i, 0]]))
+        super(dopri, self).build(input_shape)
 
-
-    def integrate(self,):
-        k = tf.zeros(self.shape, dtype=tf.float64)
-        k_alt = []
+    def integrate(self, f, y, t):
+        k = tf.zeros(self.shape, dtype=self.dtype)
         for i in range(7):
+            #print("preset", tf.shape(y), tf.shape(t))
             if i == 0:
-                val = self.f(self.y, self.t)
+                val = f(y, t)
             else:
-                a = tf.expand_dims(A[i], axis=-1)
-                tmp = tf.multiply(a, k)
+                a = tf.expand_dims(self.A[i], axis=-1)
+                #print("ak", tf.shape(a), tf.shape(k))
+                k_tmp = tf.reshape(k, [self.shape[0], self.shape[2]])
+                tmp = tf.multiply(a, k_tmp)
+                #print("tmp ktmp", tf.shape(tmp), tf.shape(k_tmp))
                 tmp = tf.reduce_sum(tmp, axis=0)
-                val = self.f(self.y + self.h * tmp, self.t + C[i] * self.h)
+                #print("tmp", tf.shape(tmp))
+                val = f(y + self.h * tmp, t + C[i] * self.h)
             k = k + tf.scatter_nd(self.indices[i], val, self.shape)
-            k_alt.append(val)
-
-        b_5 = tf.expand_dims(B[0], axis=-1)
-        fifth = tf.reduce_sum(tf.multiply(k, b_5), axis=0)
+        compat_shape = tf.concat([tf.shape(self.B[0]), tf.ones_like(tf.shape(k)[1:])], axis=-1)
+        # b_5 = tf.expand_dims(self.B[0], axis=-1)
+        b_5 = tf.reshape(self.B[0], compat_shape)
+        #print("b5", tf.shape(b_5))
+        inner = tf.multiply(k, b_5)
+        #print("inner", tf.shape(inner))
+        fifth = tf.reduce_sum(inner, axis=0)
+        #print("fifth", tf.shape(fifth))
+        #print(fifth)
         if self.adaptive:
-            b_4 = tf.expand_dims(B[1], axis=-1)
+            b_4 = tf.expand_dims(self.B[1], axis=-1)
             fourth = tf.reduce_sum(tf.multiply(k, b_4))
-            self.tau = fifth - fourth
-        return self.y + self.h*fifth
+        return y + self.h*fifth
